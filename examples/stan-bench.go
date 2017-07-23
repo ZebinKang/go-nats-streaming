@@ -14,6 +14,8 @@ import (
 	"github.com/nats-io/go-nats"
 	"github.com/nats-io/go-nats-streaming"
 	"github.com/nats-io/go-nats/bench"
+	"encoding/binary"
+	"bytes"
 )
 
 // Some sane defaults
@@ -65,7 +67,7 @@ func main() {
 
 	opts.Secure = *tls
 
-	benchmark = bench.NewBenchmark("NATS Streaming", *numSubs, *numPubs)
+	benchmark = bench.NewBenchmark("NATS Streaming", *numSubs, *numPubs,*numMsgs,*messageSize)
 
 	var startwg sync.WaitGroup
 	var donewg sync.WaitGroup
@@ -76,16 +78,15 @@ func main() {
 	startwg.Add(*numSubs)
 	for i := 0; i < *numSubs; i++ {
 		subID := fmt.Sprintf("%s-sub-%d", *clientID, i)
-		go runSubscriber(&startwg, &donewg, opts, *numMsgs, *messageSize, *ignoreOld, subID)
+		go runSubscriber(&startwg, &donewg, opts, *numMsgs, *messageSize, *ignoreOld, subID, i)
 	}
 	startwg.Wait()
 
 	// Now Publishers
 	startwg.Add(*numPubs)
-	pubCounts := bench.MsgsPerClient(*numMsgs, *numPubs)
 	for i := 0; i < *numPubs; i++ {
 		pubID := fmt.Sprintf("%s-pub-%d", *clientID, i)
-		go runPublisher(&startwg, &donewg, opts, pubCounts[i], *messageSize, *async, pubID, *maxPubAcks)
+		go runPublisher(&startwg, &donewg, opts, *numMsgs, *messageSize, *async, pubID, *maxPubAcks,i)
 	}
 
 	log.Printf("Starting benchmark [msgs=%d, msgsize=%d, pubs=%d, subs=%d]\n", *numMsgs, *messageSize, *numPubs, *numSubs)
@@ -103,7 +104,8 @@ func main() {
 	}
 }
 
-func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs int, msgSize int, async bool, pubID string, maxPubAcksInflight int) {
+func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs int, msgSize int,
+	async bool, pubID string, maxPubAcksInflight int, pubIndex int) {
 	nc, err := opts.Connect()
 	if err != nil {
 		log.Fatalf("Publisher %s can't connect: %v\n", pubID, err)
@@ -124,7 +126,9 @@ func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs in
 	}
 	published := 0
 	start := time.Now()
+	var tmp []byte= make([]byte, 8)
 
+	result:=fmt.Sprintf("%s%d",subj,pubIndex)
 	if async {
 		ch := make(chan bool)
 		acb := func(lguid string, err error) {
@@ -134,7 +138,13 @@ func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs in
 			}
 		}
 		for i := 0; i < numMsgs; i++ {
-			_, err := snc.PublishAsync(subj, msg, acb)
+			now:=time.Now().UnixNano()
+			binary.BigEndian.PutUint64(msg, uint64(now))
+			binary.BigEndian.PutUint64(tmp, uint64(i))
+			for j:=0;j<8;j++{
+				msg[j+8]=tmp[j]
+			}
+			_, err := snc.PublishAsync(result, msg, acb)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -142,7 +152,13 @@ func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs in
 		<-ch
 	} else {
 		for i := 0; i < numMsgs; i++ {
-			err := snc.Publish(subj, msg)
+			now:=time.Now().UnixNano()
+			binary.BigEndian.PutUint64(msg, uint64(now))
+			binary.BigEndian.PutUint64(tmp, uint64(i))
+			for j:=0;j<8;j++{
+				msg[j+8]=tmp[j]
+			}
+			err := snc.Publish(result, msg)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -156,7 +172,7 @@ func runPublisher(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs in
 	donewg.Done()
 }
 
-func runSubscriber(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs int, msgSize int, ignoreOld bool, subID string) {
+func runSubscriber(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs int, msgSize int, ignoreOld bool, subID string, subIndex int) {
 	nc, err := opts.Connect()
 	if err != nil {
 		log.Fatalf("Subscriber %s can't connect: %v\n", subID, err)
@@ -170,19 +186,32 @@ func runSubscriber(startwg, donewg *sync.WaitGroup, opts nats.Options, numMsgs i
 	subj := args[0]
 	ch := make(chan bool)
 	start := time.Now()
-
+	result:=fmt.Sprintf("%s%d",subj,subIndex)
 	received := 0
+	counter:=0
 	mcb := func(msg *stan.Msg) {
 		received++
-		if received >= numMsgs {
+		var ret int64
+		buf := bytes.NewBuffer(msg.Data[0:8])
+		binary.Read(buf, binary.BigEndian, &ret)
+		received++
+		var msgIndex int64
+		buf2 := bytes.NewBuffer(msg.Data[8:16])
+		binary.Read(buf2, binary.BigEndian, &msgIndex)
+
+			now:=time.Now().UnixNano()
+			benchmark.AddSubLatency(subIndex,(int)(now-ret))
+			counter+=1
+
+		if msgIndex+1 >= (int64)(numMsgs) {
 			ch <- true
 		}
 	}
 
 	if ignoreOld {
-		snc.Subscribe(subj, mcb)
+		snc.Subscribe(result, mcb)
 	} else {
-		snc.Subscribe(subj, mcb, stan.DeliverAllAvailable())
+		snc.Subscribe(result, mcb, stan.DeliverAllAvailable())
 	}
 	startwg.Done()
 
